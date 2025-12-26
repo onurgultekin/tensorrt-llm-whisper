@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import base64
 import os
+from typing import Optional
 
 import tiktoken
 
@@ -113,7 +114,7 @@ LANGUAGES = {
 }
 
 
-def get_tokenizer(name: str = "multilingual", num_languages: int = 99, tokenizer_dir: str | None = None):
+def get_tokenizer(name: str = "multilingual", num_languages: int = 99, tokenizer_dir: Optional[str] = None):
     if tokenizer_dir is None:
         vocab_path = os.path.join(os.path.dirname(__file__), f"assets/{name}.tiktoken")
     else:
@@ -149,4 +150,3 @@ def get_tokenizer(name: str = "multilingual", num_languages: int = 99, tokenizer
         mergeable_ranks=ranks,
         special_tokens=special_tokens,
     )
-

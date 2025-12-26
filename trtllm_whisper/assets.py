@@ -5,6 +5,7 @@ import os
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 
 OPENAI_WHISPER_MODELS = {
@@ -46,7 +47,7 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def download_file(url: str, dst: Path, *, expected_sha256: str | None = None) -> DownloadResult:
+def download_file(url: str, dst: Path, *, expected_sha256: Optional[str] = None) -> DownloadResult:
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists() and dst.is_file():
         if expected_sha256 is None:
@@ -95,4 +96,3 @@ def ensure_whisper_checkpoint(assets_dir: Path, model_name: str) -> Path:
     dst = assets_dir / f"{model_name}.pt"
     download_file(url, dst, expected_sha256=expected_sha256)
     return dst
-

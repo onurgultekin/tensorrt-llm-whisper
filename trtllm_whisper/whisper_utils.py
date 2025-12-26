@@ -55,7 +55,7 @@ def load_audio_wav_format(wav_path: str):
 
 
 @lru_cache(maxsize=None)
-def mel_filters(device, n_mels: int, mel_filters_dir: str | None = None) -> torch.Tensor:
+def mel_filters(device, n_mels: int, mel_filters_dir: Optional[str] = None) -> torch.Tensor:
     if n_mels not in {80, 128}:
         raise ValueError(f"Unsupported n_mels: {n_mels}")
     if mel_filters_dir is None:
@@ -71,7 +71,7 @@ def log_mel_spectrogram(
     n_mels: int,
     padding: int = 0,
     device: Optional[Union[str, torch.device]] = None,
-    mel_filters_dir: str | None = None,
+    mel_filters_dir: Optional[str] = None,
 ):
     if not torch.is_tensor(audio):
         if isinstance(audio, str):
@@ -99,4 +99,3 @@ def log_mel_spectrogram(
     log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
     log_spec = (log_spec + 4.0) / 4.0
     return log_spec
-

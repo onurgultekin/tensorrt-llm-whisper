@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
 import torch
 
 import tensorrt_llm
@@ -15,7 +16,7 @@ from tensorrt_llm.bindings import GptJsonConfig
 from tensorrt_llm.runtime import PYTHON_BINDINGS
 
 from .tokenizer import get_tokenizer
-from .whisper_utils import load_audio, load_audio_wav_format, log_mel_spectrogram
+from .whisper_utils import SAMPLE_RATE, load_audio, load_audio_wav_format, log_mel_spectrogram
 
 if PYTHON_BINDINGS:
     from tensorrt_llm.runtime import ModelRunnerCpp
@@ -248,3 +249,97 @@ class WhisperTRTLLMRunner:
             f.write(audio_bytes)
             f.flush()
             return self.transcribe_file_with_timings(Path(f.name), cfg=cfg)
+
+    def transcribe_pcm16le(self, pcm_bytes: bytes, *, sr: int = SAMPLE_RATE, cfg: Optional[InferenceConfig] = None) -> str:
+        return self.transcribe_pcm16le_with_timings(pcm_bytes, sr=sr, cfg=cfg)["text"]
+
+    def transcribe_pcm16le_with_timings(
+        self, pcm_bytes: bytes, *, sr: int = SAMPLE_RATE, cfg: Optional[InferenceConfig] = None
+    ) -> dict[str, Any]:
+        cfg = cfg or InferenceConfig()
+        if sr != SAMPLE_RATE:
+            raise ValueError(f"Unsupported sample rate: {sr} (expected {SAMPLE_RATE})")
+
+        total_t0 = time.perf_counter()
+
+        decode_t0 = time.perf_counter()
+        audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        audio_sec = float(audio.shape[0]) / float(sr) if audio.shape[0] else 0.0
+        decode_ms = (time.perf_counter() - decode_t0) * 1000
+
+        mel_t0 = time.perf_counter()
+        mel = log_mel_spectrogram(
+            audio,
+            self.n_mels,
+            device="cuda",
+            mel_filters_dir=str(self.assets_dir),
+        ).type(torch.float16)
+        torch.cuda.synchronize()
+        mel_ms = (time.perf_counter() - mel_t0) * 1000
+
+        mel = mel.unsqueeze(0)  # [B=1, n_mels, frames]
+        pad_t0 = time.perf_counter()
+        if cfg.padding_strategy == "max":
+            if mel.shape[2] < 3000:
+                mel = torch.nn.functional.pad(mel, (0, 3000 - mel.shape[2]))
+        elif cfg.padding_strategy == "longest":
+            pass
+        elif cfg.padding_strategy == "nopad":
+            pass
+        else:
+            raise ValueError("padding_strategy must be one of: max|longest|nopad")
+        torch.cuda.synchronize()
+        pad_ms = (time.perf_counter() - pad_t0) * 1000
+
+        input_lengths = torch.tensor([mel.shape[2]], dtype=torch.int32, device="cuda")
+        prompt_ids = self.tokenizer.encode(cfg.text_prefix, allowed_special=self.tokenizer.special_tokens_set)
+        decoder_input_ids = torch.tensor(prompt_ids, dtype=torch.int64).unsqueeze(0)  # [B=1, prompt]
+
+        encoder_input_features = mel.transpose(1, 2)  # [B, T, n_mels]
+
+        gen_wall_t0 = time.perf_counter()
+        gen_evt_start = torch.cuda.Event(enable_timing=True)
+        gen_evt_end = torch.cuda.Event(enable_timing=True)
+        with torch.no_grad():
+            gen_evt_start.record()
+            outputs = self.model_runner.generate(
+                batch_input_ids=decoder_input_ids,
+                encoder_input_features=encoder_input_features,
+                encoder_output_lengths=input_lengths // 2,
+                max_new_tokens=cfg.max_new_tokens,
+                end_id=self.eot_id,
+                pad_id=self.eot_id,
+                num_beams=cfg.num_beams,
+                output_sequence_lengths=True,
+                return_dict=True,
+            )
+            gen_evt_end.record()
+            torch.cuda.synchronize()
+        gen_wall_ms = (time.perf_counter() - gen_wall_t0) * 1000
+        gen_cuda_ms = float(gen_evt_start.elapsed_time(gen_evt_end))
+
+        post_t0 = time.perf_counter()
+        out = outputs["output_ids"].cpu().numpy().tolist()
+        token_ids = out[0][0]
+        token_ids = token_ids[len(prompt_ids):]
+        if self.eot_id in token_ids:
+            token_ids = token_ids[:token_ids.index(self.eot_id)]
+        text = self._decode_tokens(token_ids)
+        post_ms = (time.perf_counter() - post_t0) * 1000
+
+        total_ms = (time.perf_counter() - total_t0) * 1000
+        rtf_cuda = (gen_cuda_ms / 1000.0) / audio_sec if audio_sec > 0 else None
+        return {
+            "text": text,
+            "audio_sec": audio_sec,
+            "rtf_cuda": rtf_cuda,
+            "timings_ms": {
+                "total": total_ms,
+                "audio_decode": decode_ms,
+                "mel": mel_ms,
+                "pad": pad_ms,
+                "generate_wall": gen_wall_ms,
+                "generate_cuda": gen_cuda_ms,
+                "postprocess": post_ms,
+            },
+        }

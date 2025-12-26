@@ -55,6 +55,24 @@ Süre ölçümüyle:
 curl -F "file=@audio.wav" "https://<MODAL-URL>/transcribe?language=tr&task=transcribe&timings=true"
 ```
 
+## 4) WebSocket (Push-to-talk)
+
+Amaç: tek bağlantı + 20ms chunk + client-side VAD ile “boş” ses göndermeden, **push-to-talk stop** anında transcribe etmek.
+
+Server: `modal serve modal_app.py` ile `/ws` açılır.
+
+Client (lokalde):
+
+```bash
+pip install sounddevice webrtcvad websockets
+python ws_client.py --url wss://<MODAL-URL>/ws --language tr
+```
+
+- `Enter`: start/stop
+- Varsayılan: sadece `end` sonrası `final` döner (connection açık kalır).
+- İstersen otomatik segment için: `--segment-silence-ms 700` (pause sonrası `segment` mesajı)
+- VAD sınırlarında kelime kırpılması olursa: `--pre-roll-ms 200` ve `--hangover-ms 400` değerlerini artırmayı veya `--vad 1`/`--vad 0` denemeyi düşün.
+
 Prod için:
 
 ```bash
