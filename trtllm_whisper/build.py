@@ -14,7 +14,7 @@ class BuildConfig:
     inference_precision: str = "float16"
     use_weight_only: bool = True
     weight_only_precision: str = "int8"  # int8|int4
-    max_batch_size: int = 1
+    max_batch_size: int = 4  # Increased for inflight batching (multi-user support)
     max_beam_width: int = 1
     max_encoder_input_len: int = 3000
     max_output_len: int = 96

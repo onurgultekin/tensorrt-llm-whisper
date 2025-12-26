@@ -181,10 +181,10 @@ class WhisperService:
     image=IMAGE,
     gpu="A10",
     timeout=60 * 60,
-    cpu=4,
-    memory=16384,
+    cpu=8,  # Increased for better concurrency handling
+    memory=24576,  # Increased for batch size 4 (16GB → 24GB)
     volumes={MOUNT_PATH: vol},
-    scaledown_window=10 * 60,
+    scaledown_window=10 * 60
 )
 @modal.asgi_app()
 def web():
@@ -215,7 +215,8 @@ def web():
         max_beam_width=cfg.max_beam_width,
     )
 
-    inference_lock: Optional[asyncio.Lock] = None
+    # No inference lock - TensorRT-LLM handles inflight batching internally
+    # Multiple concurrent requests will be batched automatically
 
     def _build_text_prefix(*, language: str, task: str, timestamps: bool) -> str:
         text_prefix = "<|startoftranscript|>"
@@ -225,12 +226,6 @@ def web():
         if not timestamps:
             text_prefix += "<|notimestamps|>"
         return text_prefix
-
-    async def _get_inference_lock() -> asyncio.Lock:
-        nonlocal inference_lock
-        if inference_lock is None:
-            inference_lock = asyncio.Lock()
-        return inference_lock
 
     api = FastAPI()
 
@@ -284,12 +279,11 @@ def web():
                     max_new_tokens=max_new_tokens,
                 )
 
-                lock = await _get_inference_lock()
+                # No lock - TensorRT-LLM handles concurrent requests with inflight batching
                 t0 = time.perf_counter()
-                async with lock:
-                    result = await asyncio.to_thread(
-                        runner.transcribe_pcm16le_with_timings, pcm, sr=sr, cfg=cfg_local
-                    )
+                result = await asyncio.to_thread(
+                    runner.transcribe_pcm16le_with_timings, pcm, sr=sr, cfg=cfg_local
+                )
 
                 if epoch != session_epoch:
                     return None
