@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# Modal/local artifacts
+.modal/
+.venv/
+
+# Generated model artifacts (kept in Modal Volume, not git)
+assets/
+checkpoints/
+engines/
+
+# Local clone used for reading upstream examples
+TensorRT-LLM/
+
