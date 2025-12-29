@@ -20,6 +20,85 @@ from tensorrt_llm.models.convert_utils import weight_only_quantize_dict
 from tensorrt_llm.quantization import QuantAlgo
 
 
+def _rename_trtllm018_weight_keys(weights: dict, *, component: str) -> dict:
+    """Rename checkpoint keys to TRT-LLM 0.18+ Whisper naming scheme.
+
+    TRT-LLM 0.18's Whisper `trtllm-build` expects keys like:
+      - encoder: `encoder_layers.*`, `conv1.*`, `position_embedding.*`, `ln_post.*`
+      - decoder: `decoder_layers.*`, `vocab_embedding.*`, `position_embedding.*`, ...
+
+    This replaces the older `transformer.*` prefix naming used by earlier examples.
+    We intentionally avoid writing both key sets, because safetensors rejects saving
+    tensors that share memory under multiple keys.
+    """
+
+    out: dict = {}
+
+    def _maybe_add_ln_aliases(k: str, v: torch.Tensor) -> None:
+        # Some versions use `ln_f`, others use `ln_post`, and some decoder configs use
+        # `final_layernorm`. These tensors are small, so cloning aliases is OK.
+        if k.startswith("ln_f."):
+            out.setdefault("ln_post." + k[len("ln_f.") :], v.clone())
+            out.setdefault("final_layernorm." + k[len("ln_f.") :], v.clone())
+            return
+        if k.startswith("ln_post."):
+            out.setdefault("ln_f." + k[len("ln_post.") :], v.clone())
+            out.setdefault("final_layernorm." + k[len("ln_post.") :], v.clone())
+            return
+        if k.startswith("final_layernorm."):
+            out.setdefault("ln_post." + k[len("final_layernorm.") :], v.clone())
+            out.setdefault("ln_f." + k[len("final_layernorm.") :], v.clone())
+
+    if component == "encoder":
+        for k, v in weights.items():
+            if not isinstance(k, str):
+                continue
+
+            if k.startswith("transformer.layers."):
+                new_k = "encoder_layers." + k[len("transformer.layers.") :]
+            elif k.startswith("transformer."):
+                new_k = k[len("transformer.") :]
+            else:
+                new_k = k
+
+            if new_k.startswith("ln_f."):
+                new_k = "ln_post." + new_k[len("ln_f.") :]
+
+            out[new_k] = v
+            if isinstance(v, torch.Tensor):
+                _maybe_add_ln_aliases(new_k, v)
+        return out
+
+    if component == "decoder":
+        for k, v in weights.items():
+            if not isinstance(k, str):
+                continue
+
+            if k.startswith("transformer.layers."):
+                new_k = "decoder_layers." + k[len("transformer.layers.") :]
+            elif k.startswith("transformer."):
+                new_k = k[len("transformer.") :]
+            else:
+                new_k = k
+
+            # TRT-LLM 0.18 decoder expects embedding.* and final_layernorm.*
+            if new_k == "vocab_embedding.weight":
+                new_k = "embedding.vocab_embedding.weight"
+            elif new_k == "position_embedding.weight":
+                new_k = "embedding.position_embedding.weight"
+            elif new_k.startswith("ln_f."):
+                new_k = "final_layernorm." + new_k[len("ln_f.") :]
+            elif new_k.startswith("ln_post."):
+                new_k = "final_layernorm." + new_k[len("ln_post.") :]
+
+            out[new_k] = v
+            if isinstance(v, torch.Tensor):
+                _maybe_add_ln_aliases(new_k, v)
+        return out
+
+    raise ValueError(f"Unknown component: {component!r}")
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_dir', type=str, default="assets")
@@ -240,7 +319,8 @@ def convert_openai_whisper_encoder(
     weights['transformer.ln_f.bias'] = model_params[
         'encoder.ln_post.bias'].contiguous()
 
-    return weight_only_quantize_dict(weights, quant_algo=quant_algo, plugin=True)
+    weights = weight_only_quantize_dict(weights, quant_algo=quant_algo, plugin=True)
+    return _rename_trtllm018_weight_keys(weights, component="encoder")
 
 
 def convert_openai_whisper_decoder(model_metadata: dict,
@@ -357,7 +437,8 @@ def convert_openai_whisper_decoder(model_metadata: dict,
     weights['transformer.ln_f.weight'] = model_params['decoder.ln.weight']
     weights['transformer.ln_f.bias'] = model_params['decoder.ln.bias']
 
-    return weight_only_quantize_dict(weights, quant_algo=quant_algo, plugin=True)
+    weights = weight_only_quantize_dict(weights, quant_algo=quant_algo, plugin=True)
+    return _rename_trtllm018_weight_keys(weights, component="decoder")
 
 
 if __name__ == "__main__":

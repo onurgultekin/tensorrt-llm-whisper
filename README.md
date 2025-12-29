@@ -79,9 +79,25 @@ Prod için:
 modal deploy modal_app.py
 ```
 
+## 5) Load test (çoklu kullanıcı simülasyonu)
+
+Basit bir concurrency testi için `ws_load_test.py` ile aynı anda birden fazla WebSocket client simüle edebilirsin.
+
+```bash
+pip install websockets
+python ws_load_test.py --url wss://<MODAL-URL>/ws --users 5 --ramp-s 10 --sessions-per-user 2
+```
+
+Notlar:
+- `whisper_sample.wav` (repo içinde) 16kHz mono PCM olduğu için varsayılan olarak onu kullanır.
+- `--speed 1.0` gerçek zamanlıya yakın gönderir; `--speed 0` mümkün olduğunca hızlı gönderir.
+
 ## Notlar / Sık karşılaşılanlar
 
 - Bu akış **Python runtime** değil; TensorRT-LLM’in **C++ runtime’ını** (`ModelRunnerCpp`) kullanır.
 - `trtllm-build` tarafında `--paged_kv_cache enable` + `--remove_input_padding enable` ile inflight batching desteklenir.
 - Varsayılan padding stratejisi `max` (30sn/3000 frame’e pad). Resmi OpenAI Whisper modelleri için en güvenlisi budur.
 - İlk kurulumda image build + wheel indirme (özellikle `tensorrt_llm`) ve engine build uzun sürebilir.
+- Aynı GPU üzerinde **Whisper + formatter LLM** birlikte yüklenecekse, TRT-LLM varsayılan olarak KV cache için GPU RAM’in büyük kısmını ayırmaya çalışır; gerekirse şu env’leri küçült:
+  - `VOICEOS_WHISPER_KV_CACHE_FRACTION` (örn. `0.2`)
+  - `VOICEOS_FORMATTER_KV_CACHE_FRACTION` (örn. `0.12`)

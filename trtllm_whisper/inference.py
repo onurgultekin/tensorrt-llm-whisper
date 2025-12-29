@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import tempfile
 import time
@@ -34,14 +35,22 @@ def _read_component_config(engine_dir: Path, component: str) -> dict:
 
 @dataclass(frozen=True)
 class InferenceConfig:
-    max_new_tokens: int = 96
+    max_new_tokens: int = 448  # Increased for longer transcriptions (~350 words)
     num_beams: int = 1
     text_prefix: str = "<|startoftranscript|><|en|><|transcribe|><|notimestamps|>"
     padding_strategy: str = "max"  # max|longest (single file behaves same) | nopad (cpp only)
 
 
 class WhisperTRTLLMRunner:
-    def __init__(self, *, engine_dir: Path, assets_dir: Path, max_batch_size: int, max_beam_width: int):
+    def __init__(
+        self,
+        *,
+        engine_dir: Path,
+        assets_dir: Path,
+        max_batch_size: int,
+        max_output_len: int,
+        max_beam_width: int,
+    ):
         if not PYTHON_BINDINGS:
             raise RuntimeError(
                 "tensorrt_llm python bindings (C++ runtime) not available. "
@@ -50,6 +59,7 @@ class WhisperTRTLLMRunner:
 
         self.engine_dir = engine_dir
         self.assets_dir = assets_dir
+        self.max_output_len = max(1, int(max_output_len))
 
         enc_cfg = _read_component_config(engine_dir, "encoder")
         dec_cfg = _read_component_config(engine_dir, "decoder")
@@ -82,16 +92,29 @@ class WhisperTRTLLMRunner:
         runtime_mapping = tensorrt_llm.Mapping(world_size, runtime_rank)
         torch.cuda.set_device(runtime_rank % runtime_mapping.gpus_per_node)
 
+        kv_cache_fraction = float(os.getenv("VOICEOS_WHISPER_KV_CACHE_FRACTION", "0.3"))
+        if not (0.01 <= kv_cache_fraction <= 0.95):
+            raise ValueError(
+                "VOICEOS_WHISPER_KV_CACHE_FRACTION must be between 0.01 and 0.95 "
+                f"(got {kv_cache_fraction})"
+            )
+        cross_kv_cache_fraction = float(os.getenv("VOICEOS_WHISPER_CROSS_KV_CACHE_FRACTION", "0.5"))
+        if not (0.0 <= cross_kv_cache_fraction <= 1.0):
+            raise ValueError(
+                "VOICEOS_WHISPER_CROSS_KV_CACHE_FRACTION must be between 0.0 and 1.0 "
+                f"(got {cross_kv_cache_fraction})"
+            )
+
         self.model_runner = ModelRunnerCpp.from_dir(
             engine_dir=engine_dir,
             is_enc_dec=True,
             max_batch_size=max_batch_size,
             max_input_len=3000,
-            max_output_len=96,
+            max_output_len=self.max_output_len,
             max_beam_width=max_beam_width,
             debug_mode=False,
-            kv_cache_free_gpu_memory_fraction=0.9,
-            cross_kv_cache_fraction=0.5,
+            kv_cache_free_gpu_memory_fraction=kv_cache_fraction,
+            cross_kv_cache_fraction=cross_kv_cache_fraction,
         )
 
     def _decode_tokens(self, token_ids: list[int]) -> str:
@@ -132,7 +155,7 @@ class WhisperTRTLLMRunner:
                 batch_input_ids=decoder_input_ids,
                 encoder_input_features=encoder_input_features,
                 encoder_output_lengths=input_lengths // 2,
-                max_new_tokens=cfg.max_new_tokens,
+                max_new_tokens=min(cfg.max_new_tokens, self.max_output_len),
                 end_id=self.eot_id,
                 pad_id=self.eot_id,
                 num_beams=cfg.num_beams,
@@ -171,6 +194,7 @@ class WhisperTRTLLMRunner:
         mel_ms = (time.perf_counter() - mel_t0) * 1000
 
         mel = mel.unsqueeze(0)  # [B=1, n_mels, frames]
+        
         pad_t0 = time.perf_counter()
         if cfg.padding_strategy == "max":
             if mel.shape[2] < 3000:
@@ -184,7 +208,9 @@ class WhisperTRTLLMRunner:
         torch.cuda.synchronize()
         pad_ms = (time.perf_counter() - pad_t0) * 1000
 
-        input_lengths = torch.tensor([mel.shape[2]], dtype=torch.int32, device="cuda")
+        # encoder_output_lengths must match the actual encoder output shape (after padding and downsampling)
+        # Whisper encoder downsamples by 2x, so output length = padded_frames // 2
+        input_lengths = torch.tensor([mel.shape[2] // 2], dtype=torch.int32, device="cuda")
         prompt_ids = self.tokenizer.encode(cfg.text_prefix, allowed_special=self.tokenizer.special_tokens_set)
         decoder_input_ids = torch.tensor(prompt_ids, dtype=torch.int64).unsqueeze(0)  # [B=1, prompt]
 
@@ -199,8 +225,8 @@ class WhisperTRTLLMRunner:
             outputs = self.model_runner.generate(
                 batch_input_ids=decoder_input_ids,
                 encoder_input_features=encoder_input_features,
-                encoder_output_lengths=input_lengths // 2,
-                max_new_tokens=cfg.max_new_tokens,
+                encoder_output_lengths=input_lengths,
+                max_new_tokens=min(cfg.max_new_tokens, self.max_output_len),
                 end_id=self.eot_id,
                 pad_id=self.eot_id,
                 num_beams=cfg.num_beams,
@@ -278,6 +304,7 @@ class WhisperTRTLLMRunner:
         mel_ms = (time.perf_counter() - mel_t0) * 1000
 
         mel = mel.unsqueeze(0)  # [B=1, n_mels, frames]
+        
         pad_t0 = time.perf_counter()
         if cfg.padding_strategy == "max":
             if mel.shape[2] < 3000:
@@ -291,7 +318,9 @@ class WhisperTRTLLMRunner:
         torch.cuda.synchronize()
         pad_ms = (time.perf_counter() - pad_t0) * 1000
 
-        input_lengths = torch.tensor([mel.shape[2]], dtype=torch.int32, device="cuda")
+        # encoder_output_lengths must match the actual encoder output shape (after padding and downsampling)
+        # Whisper encoder downsamples by 2x, so output length = padded_frames // 2
+        input_lengths = torch.tensor([mel.shape[2] // 2], dtype=torch.int32, device="cuda")
         prompt_ids = self.tokenizer.encode(cfg.text_prefix, allowed_special=self.tokenizer.special_tokens_set)
         decoder_input_ids = torch.tensor(prompt_ids, dtype=torch.int64).unsqueeze(0)  # [B=1, prompt]
 
@@ -302,11 +331,12 @@ class WhisperTRTLLMRunner:
         gen_evt_end = torch.cuda.Event(enable_timing=True)
         with torch.no_grad():
             gen_evt_start.record()
+            # Don't pass cross_attention_mask - let TensorRT-LLM handle it internally
             outputs = self.model_runner.generate(
                 batch_input_ids=decoder_input_ids,
                 encoder_input_features=encoder_input_features,
-                encoder_output_lengths=input_lengths // 2,
-                max_new_tokens=cfg.max_new_tokens,
+                encoder_output_lengths=input_lengths,
+                max_new_tokens=min(cfg.max_new_tokens, self.max_output_len),
                 end_id=self.eot_id,
                 pad_id=self.eot_id,
                 num_beams=cfg.num_beams,

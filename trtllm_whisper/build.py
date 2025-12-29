@@ -17,7 +17,7 @@ class BuildConfig:
     max_batch_size: int = 4  # Increased for inflight batching (multi-user support)
     max_beam_width: int = 1
     max_encoder_input_len: int = 3000
-    max_output_len: int = 96
+    max_output_len: int = 448  # 30 seconds max per chunk (~180 words)
     paged_kv_cache: bool = True
     remove_input_padding: bool = True
 
@@ -29,13 +29,24 @@ class BuildConfig:
         if self.remove_input_padding:
             flags.append("rip")
         flags_s = ("_" + "_".join(flags)) if flags else ""
-        return f"{self.model_name}_{wo}_mb{self.max_batch_size}_bw{self.max_beam_width}{flags_s}"
+        return f"{self.model_name}_{wo}_mb{self.max_batch_size}_bw{self.max_beam_width}_ol{self.max_output_len}{flags_s}"
 
 
 def _env_for_subprocess() -> dict[str, str]:
     env = dict(os.environ)
     env.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
     return env
+
+
+def _safetensors_has_keys(path: Path, required: list[str]) -> bool:
+    try:
+        from safetensors.torch import safe_open
+
+        with safe_open(str(path), framework="pt", device="cpu") as f:
+            keys = set(f.keys())
+        return all(k in keys for k in required)
+    except Exception:
+        return False
 
 
 def convert_checkpoint(*, assets_dir: Path, checkpoints_dir: Path, cfg: BuildConfig) -> Path:
@@ -46,7 +57,25 @@ def convert_checkpoint(*, assets_dir: Path, checkpoints_dir: Path, cfg: BuildCon
     encoder_st = out_dir / "encoder" / "rank0.safetensors"
     decoder_st = out_dir / "decoder" / "rank0.safetensors"
     if encoder_st.exists() and decoder_st.exists():
-        return out_dir
+        # TRT-LLM 0.18 renamed Whisper checkpoint keys. Validate a few keys to avoid
+        # accidentally reusing an incompatible cached checkpoint.
+        enc_ok = _safetensors_has_keys(
+            encoder_st,
+            required=[
+                "encoder_layers.0.attention.qkv.weight",
+                "conv1.weight",
+            ],
+        )
+        dec_ok = _safetensors_has_keys(
+            decoder_st,
+            required=[
+                "decoder_layers.0.self_attention.qkv.weight",
+                "embedding.vocab_embedding.weight",
+                "final_layernorm.weight",
+            ],
+        )
+        if enc_ok and dec_ok:
+            return out_dir
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -148,4 +177,3 @@ def build_engines(*, checkpoint_dir: Path, engines_dir: Path, cfg: BuildConfig) 
     if not (enc_engine.exists() and dec_engine.exists()):
         raise RuntimeError("Engine build finished, but expected rank0.engine files not found.")
     return engine_dir
-
