@@ -672,8 +672,75 @@ def web():
         t = "\n".join(_SPACE_RE.sub(" ", line).strip() for line in t.split("\n"))
         return t.strip()
 
+    # Common filler words across languages (for preprocessing/analysis)
+    FILLER_WORDS = {
+        # English
+        "um", "uh", "er", "ah", "like", "you know", "i mean", "sort of", "kind of", "basically", "actually",
+        # Turkish
+        "yani", "işte", "şey", "hani", "falan", "filan", "böyle", "yani şey", "işte şey",
+        # Spanish
+        "eh", "este", "pues", "o sea", "bueno", "entonces",
+        # French
+        "euh", "ben", "alors", "donc", "quoi", "enfin",
+        # German
+        "äh", "ähm", "also", "halt", "sozusagen", "quasi",
+        # Italian
+        "ehm", "cioè", "allora", "dunque", "insomma",
+        # Portuguese
+        "né", "tipo", "então", "quer dizer",
+        # Russian (transliterated)
+        "nu", "vot", "tak", "znachit",
+        # Japanese (transliterated)
+        "ano", "eto", "ma",
+        # Korean (transliterated)
+        "geu", "eumm",
+        # Arabic (transliterated)
+        "yani", "yaani",
+        # Chinese (transliterated)
+        "nage", "jiushi", "ranhou",
+    }
+
+    def _trim_llm_preamble(text: str) -> str:
+        """Remove common LLM preambles like 'Here is...', 'Here's...', etc."""
+        t = text.strip()
+        if not t:
+            return t
+        
+        # Common preamble patterns (case-insensitive)
+        preambles = [
+            "here is the cleaned text:",
+            "here's the cleaned text:",
+            "here is the polished text:",
+            "here's the polished text:",
+            "here is the corrected text:",
+            "here's the corrected text:",
+            "here is the text:",
+            "here's the text:",
+            "here is:",
+            "here's:",
+            "cleaned text:",
+            "polished text:",
+            "corrected text:",
+        ]
+        
+        t_lower = t.lower()
+        for preamble in preambles:
+            if t_lower.startswith(preamble):
+                # Remove the preamble and any following whitespace/newlines
+                t = t[len(preamble):].lstrip()
+                break
+        
+        return t
+
     def _word_tokens(text: str) -> list[str]:
-        return [unicodedata.normalize("NFKC", m.group(0)).casefold() for m in _WORD_TOKEN_RE.finditer(text)]
+        """Extract normalized word tokens, handling Turkish and other agglutinative languages."""
+        tokens = []
+        for m in _WORD_TOKEN_RE.finditer(text):
+            word = unicodedata.normalize("NFKC", m.group(0))
+            # Remove apostrophes and hyphens for comparison (slide'teki → slideteki)
+            normalized = word.replace("'", "").replace("'", "").replace("-", "").casefold()
+            tokens.append(normalized)
+        return tokens
 
     def _is_subsequence(source: list[str], target: list[str]) -> bool:
         if not target:
@@ -686,11 +753,52 @@ def web():
                     return True
         return False
 
-    def _safety_check(*, input_text: str, output_text: str) -> dict:
+    def _is_morphological_variant(word1: str, word2: str) -> bool:
+        """Check if two words are morphological variants (e.g., Turkish suffixes)."""
+        if word1 == word2:
+            return True
+        # If one is a substring of the other and they share significant prefix
+        if len(word1) >= 4 and len(word2) >= 4:
+            shorter = min(word1, word2, key=len)
+            longer = max(word1, word2, key=len)
+            if longer.startswith(shorter) and len(shorter) / len(longer) >= 0.6:
+                return True
+        return False
+
+    def _safety_check(*, input_text: str, output_text: str, allow_reordering: bool = False) -> dict:
         in_tokens = _word_tokens(input_text)
         out_tokens = _word_tokens(output_text)
         in_set = set(in_tokens)
-        out_new = [t for t in out_tokens if t not in in_set]
+        
+        # Check for truly new tokens (not morphological variants)
+        out_new = []
+        for out_tok in out_tokens:
+            if out_tok in in_set:
+                continue
+            # Check if it's a morphological variant of any input token
+            is_variant = any(_is_morphological_variant(out_tok, in_tok) for in_tok in in_tokens)
+            if not is_variant:
+                out_new.append(out_tok)
+        
+        # For formatting contexts (email, doc), allow reordering as long as no new words
+        if allow_reordering:
+            # Check if all output tokens exist in input (allowing reordering)
+            all_tokens_present = all(
+                any(_is_morphological_variant(out_tok, in_tok) for in_tok in in_tokens)
+                for out_tok in out_tokens
+            )
+            ok = bool(output_text.strip()) and (len(out_new) == 0) and all_tokens_present
+            return {
+                "ok": ok,
+                "subsequence": False,  # Not checking subsequence when reordering allowed
+                "in_token_count": len(in_tokens),
+                "out_token_count": len(out_tokens),
+                "out_new_token_count": len(out_new),
+                "out_new_tokens_sample": out_new[:12],
+                "allow_reordering": True,
+            }
+        
+        # Standard strict check (for chat, generic, etc.)
         subseq_ok = _is_subsequence(in_tokens, out_tokens)
         ok = bool(output_text.strip()) and (len(out_new) == 0) and subseq_ok
         return {
@@ -700,6 +808,7 @@ def web():
             "out_token_count": len(out_tokens),
             "out_new_token_count": len(out_new),
             "out_new_tokens_sample": out_new[:12],
+            "allow_reordering": False,
         }
 
     def _maybe_format_numbered_list(text: str) -> tuple[str, dict]:
@@ -824,18 +933,38 @@ def web():
         t = (title or "").lower()
         a = (active_app or "").lower()
 
-        if d in {"mail.google.com"} or "gmail" in d or "outlook" in d:
+        # Code/IDE contexts
+        if any(x in a for x in ["cursor", "windsurf", "vscode", "visual studio code", "code", "sublime", "atom", "vim", "neovim", "intellij", "pycharm", "webstorm"]):
+            return "code"
+        if any(x in d for x in ["github.com", "gitlab.com", "replit.com", "codesandbox.io", "stackblitz.com"]):
+            return "code"
+        if any(x in t for x in ["cursor", "windsurf", "vscode", "code editor", "ide"]):
+            return "code"
+
+        # Email contexts
+        if d in {"mail.google.com"} or "gmail" in d or "outlook" in d or "mail.yahoo" in d:
             return "email"
-        if d in {"chat.openai.com", "chatgpt.com"} or "chatgpt" in t:
+        if "email" in a or "outlook" in a or "gmail" in a or "mail" in a:
+            return "email"
+
+        # Chat/messaging contexts
+        if d in {"chat.openai.com", "chatgpt.com", "claude.ai", "web.whatsapp.com", "web.telegram.org"}:
             return "chat_prompt"
-        if d in {"docs.google.com", "notion.so"}:
-            return "doc"
-        if "email" in a or "outlook" in a or "gmail" in a:
-            return "email"
+        if "chatgpt" in t or "claude" in t or "gemini" in t:
+            return "chat_prompt"
+        if any(x in a for x in ["whatsapp", "telegram", "slack", "discord", "teams", "messenger"]):
+            return "chat_message"
         if "chat app" in a or "messaging" in a:
             return "chat_message"
-        if "notes" in a:
+
+        # Document contexts
+        if d in {"docs.google.com", "notion.so", "coda.io", "airtable.com"}:
             return "doc"
+        if any(x in a for x in ["word", "pages", "notes", "notion", "obsidian", "roam"]):
+            return "doc"
+        if "notes" in a or "document" in a:
+            return "doc"
+
         return "generic"
 
     def _system_prompt(
@@ -857,83 +986,130 @@ def web():
 
         template_rules = {
             "email": (
-                "Template: email\n"
-                "- Format as an email BODY draft.\n"
-                "- Do NOT invent a subject, greeting, or signature unless the user dictated them.\n"
+                "Email format. MUST structure as professional email:\n"
+                "- If multiple action items/tasks mentioned → format as bullet list (• or numbered)\n"
+                "- Organize into clear paragraphs (use blank lines)\n"
+                "- Convert time references: noon→12 PM, morning→9 AM\n"
+                "- Professional tone but keep natural\n"
+                "- Do NOT invent greetings/signatures unless dictated"
             ),
-            "chat_prompt": (
-                "Template: chat_prompt\n"
-                "- Format as a clean chat message.\n"
-                "- Do NOT add framing like \"please\" / \"can you\" / \"let's\" unless dictated.\n"
-            ),
+            "chat_prompt": "Direct chat message. Conversational. Remove unnecessary politeness.",
+            "chat_message": "Casual chat. Keep informal tone.",
             "doc": (
-                "Template: doc\n"
-                "- Format as clean prose with paragraphs.\n"
-                "- Do NOT rewrite for style.\n"
+                "Document format. Structure clearly:\n"
+                "- Organize into paragraphs\n"
+                "- Format lists when appropriate\n"
+                "- Professional structure"
             ),
-            "generic": "Template: generic\n- Format as clean text (sentence/paragraph).",
-        }.get(template, "Template: generic\n- Format as clean text (sentence/paragraph).")
+            "code": "Preserve exact casing (camelCase, snake_case, etc.), dev tools (Supabase, Vercel, etc.), file paths, syntax.",
+            "generic": "Clean natural text.",
+        }.get(template, "Clean natural text.")
 
-        # Dictation-focused, multilingual, minimum-edit prompt.
-        base_rules = f"""
-You are a dictation editor for a speech-to-text app. The input is a raw transcript.
-Your job is to produce the CLEANED FINAL TEXT with MINIMAL edits.
+        # Ultra-focused dictation prompt - NO room for "helpful assistant" behavior
+        base_rules = f"""You are a dictation text cleaner. Input = raw speech transcript. Output = cleaned text ONLY.
 
-Absolute rules (non-negotiable):
-- Output MUST be in the SAME language as the input. NEVER translate.
-- Do NOT paraphrase, rephrase, summarize, or add new information.
-- Do NOT add new words that were not spoken.
-- If uncertain, output the input verbatim (minus obvious filler/stutters) rather than inventing text.
-- Output ONLY the final cleaned text. No explanations, no preambles, no markdown, no quotes.
+CRITICAL RULES:
+1. Output the EXACT SAME LANGUAGE as input. NEVER translate.
+2. Use ONLY words from the input (you may remove words, add punctuation/newlines/formatting).
+3. For agglutinative languages (Turkish, Finnish, etc.): You may adjust suffixes for grammar, but keep root words.
+4. NO explanations. NO preambles. NO "Here is..." or "Here's the...". NO markdown. NO quotes around output.
+5. Output STARTS with the actual cleaned text, nothing before it.
 
-Allowed edits (you may do ONLY these):
-1) Remove filler/hesitation sounds (e.g., "um", "uh", "erm", "hmm") and similar in the input language.
-2) Remove stutters and duplicated words/phrases.
-3) Handle self-corrections: keep the FINAL version only.
-   Example: "Let's meet at 2 ... actually 3" → "Let's meet at 3"
-4) Fix punctuation and capitalization (do NOT change wording).
-5) Convert spoken punctuation commands into symbols (in ANY language).
-   - comma → ,
-   - period / full stop / dot → .
-   - question mark → ?
-   - exclamation mark → !
-   - colon → :
-   - semicolon → ;
-   - dash / hyphen → -
-   - ellipsis → ...
-   - open quote / close quote → " ... "
-   - open parenthesis / close parenthesis → ( ... )
-   - open bracket / close bracket → [ ... ]
-   - new line → newline
-   - new paragraph → blank line
-   - other symbols when dictated: slash / backslash / underscore / plus / equals / asterisk / at sign / hashtag.
-6) If the user dictates a numbered list using numbers, format it as a numbered list (one item per line).
-   Example: "1 apples 2 bananas 3 oranges" →\n1. apples\n2. bananas\n3. oranges
+ALLOWED EDITS:
+• Remove fillers: um, uh, er, ah, like, you know, I mean, yani, işte, şey, hani, falan, eh, este, pues, euh, äh, ähm (and equivalents in all languages)
+• Remove stutters: "I I I think" → "I think"
+• Remove repetitions: "the the problem" → "the problem"
+• Handle self-corrections (keep FINAL version only):
+  - "meet at 2... actually 3" → "meet at 3"
+  - "send to John... no wait Sarah" → "send to Sarah"
+  - Recognize: actually, I mean, no wait, sorry, yok, aslında, değil, etc.
+• Fix punctuation & capitalization (don't change words)
+• Add apostrophes for clarity: "slideteki" → "slide'teki", "4teki" → "4'teki"
+• Convert spoken punctuation: "comma"→, "period"→. "question mark"→? "virgül"→, "nokta"→. etc.
+• Format numbered lists: "1 apples 2 bananas" → "1. Apples\n2. Bananas"
+• Format action items as bullets when multiple tasks mentioned
+• Normalize time expressions: "noon"→"12 PM", "midnight"→"12 AM" (use words from input)
+• Structure into paragraphs when natural topic breaks occur
 
-{template_rules}
+EXAMPLES:
 
-Context (for formatting only, not for inventing content):
-{ctx}
-""".strip()
+Input: "Hi Nick. What I'd actually like to do here is conduct a bit more testing, if possible."
+Output: "Hi Nick,
+
+What I actually want to do here is conduct a bit more testing, if possible."
+
+Input: "Hey um for tomorrow's meeting we need to finish the deck design has two slides left also check slide 4 numbers let's send Rachel the final copy before noon"
+Output: "For tomorrow's meeting:
+
+• Finish the deck — design has two slides left
+• Check slide 4 numbers
+• Send Rachel the final copy before 12 PM"
+
+Input: "Selamlar yarınki toplantı için sunumu kontrol ederim dördüncü slidedeki rakamlar yanlış olabilir dizayn kısmında eksikler vardı onları da giderelim bir de Rachel onları bana tekrar geri göndersin"
+Output: "Selamlar. Yarınki toplantı için:
+
+• Sunumu kontrol edeceğim
+• Dördüncü slide'deki rakamlar yanlış olabilir
+• Dizayn kısmında eksikler vardı — onları giderelim
+• Rachel onları bana tekrar göndersin"
+
+Input: "Yarınki toplantı için şu üç maddeyi bitirmemiz gerekiyor Ahmet Mehmet'i arasın Mehmet Berfin'i arasın Berfin de beni arasın"
+Output: "Yarınki toplantı için şu üç maddeyi bitirmemiz gerekiyor:
+
+• Ahmet Mehmet'i arasın
+• Mehmet Berfin'i arasın
+• Berfin de beni arasın"
+
+Input: "Let's meet at 2 no wait actually 3 would be better"
+Output: "Let's meet at 3."
+
+Input: "I need to buy milk eggs bread and also pick up the dry cleaning"
+Output: "I need to buy:
+• Milk
+• Eggs
+• Bread
+
+Also pick up the dry cleaning."
+
+Template: {template_rules}
+Context: {ctx}
+
+Remember: Output ONLY the cleaned text. Start immediately with the text itself. When you see multiple tasks/items, FORMAT AS BULLET LIST.""".strip()
 
         return base_rules
 
     def _repair_system_prompt(*, base_system: str) -> str:
-        return (
-            base_system
-            + "\n\nSTRICT MODE:\n"
-            "- You MUST NOT introduce ANY new words.\n"
-            "- Use ONLY words that already appear in the INPUT (you may remove words, and you may add punctuation/newlines).\n"
-            "- Do NOT translate.\n"
-            "- Output ONLY the corrected cleaned text."
-        )
+        return """DICTATION TEXT CLEANER - STRICT MODE
 
-    def _build_prompt(*, system: str, user_text: str) -> str:
+Previous output REJECTED for adding new words.
+
+ABSOLUTE RULES:
+1. Use ONLY words that appear in the INPUT
+2. You may: remove words, reorder slightly, add punctuation/newlines
+3. You may NOT: add new words, translate, paraphrase, explain
+4. NO preambles. NO "Here is...". NO explanations.
+5. Output STARTS immediately with the cleaned text.
+
+ALLOWED:
+• Remove fillers (um, uh, yani, işte, etc.)
+• Remove stutters/repetitions
+• Fix punctuation
+• Handle self-corrections (keep final version)
+• Format lists if numbered
+
+OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of the cleaned text."""
+
+    def _build_prompt(*, system: str, user_text: str, is_email: bool = False) -> str:
         if tokenizer is None:
             raise RuntimeError("Tokenizer not loaded")
+        # Add explicit instruction in user message to prevent "helpful" preambles
+        if is_email:
+            user_message = f"Clean this dictation transcript. If multiple tasks/items, format as bullet list. Output ONLY the cleaned text, no preambles:\n\n{user_text}"
+        else:
+            user_message = f"Clean this dictation transcript. Output ONLY the cleaned text, no preambles:\n\n{user_text}"
         messages = [
             {"role": "system", "content": system},
-            {"role": "user", "content": user_text},
+            {"role": "user", "content": user_message},
         ]
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
@@ -1017,7 +1193,8 @@ Context (for formatting only, not for inventing content):
             title=title,
             language=language,
         )
-        prompt = _build_prompt(system=system, user_text=llm_input_text)
+        is_email_template = template == "email"
+        prompt = _build_prompt(system=system, user_text=llm_input_text, is_email=is_email_template)
 
         passes: list[dict] = []
 
@@ -1027,8 +1204,12 @@ Context (for formatting only, not for inventing content):
         llm_ms = (time.perf_counter() - t0) * 1000
         server_total_ms = (time.perf_counter() - req_t0) * 1000
 
-        llm_output_1 = (out.outputs[0].text or "").strip()
-        safety_1 = _safety_check(input_text=llm_input_text, output_text=llm_output_1)
+        llm_output_1_raw = (out.outputs[0].text or "").strip()
+        llm_output_1 = _trim_llm_preamble(llm_output_1_raw)
+        
+        # Allow reordering for email/doc templates (formatting contexts)
+        allow_reordering = template in {"email", "doc"}
+        safety_1 = _safety_check(input_text=llm_input_text, output_text=llm_output_1, allow_reordering=allow_reordering)
         passes.append(
             {
                 "pass": "main",
@@ -1056,7 +1237,7 @@ Context (for formatting only, not for inventing content):
 
         trimmed_1 = _trim_output_to_safe_candidate(input_text=llm_input_text, output_text=llm_output_1)
         if trimmed_1 is not None:
-            safety_trim_1 = _safety_check(input_text=llm_input_text, output_text=trimmed_1)
+            safety_trim_1 = _safety_check(input_text=llm_input_text, output_text=trimmed_1, allow_reordering=allow_reordering)
             passes.append(
                 {
                     "pass": "main_trim",
@@ -1082,7 +1263,7 @@ Context (for formatting only, not for inventing content):
 
         # Repair pass (still uses the LLM, but enforces "no new words" more aggressively).
         repair_system = _repair_system_prompt(base_system=system)
-        repair_prompt = _build_prompt(system=repair_system, user_text=llm_input_text)
+        repair_prompt = _build_prompt(system=repair_system, user_text=llm_input_text, is_email=is_email_template)
 
         t1 = time.perf_counter()
         async with gen_lock:
@@ -1090,8 +1271,9 @@ Context (for formatting only, not for inventing content):
         llm_ms += (time.perf_counter() - t1) * 1000
         server_total_ms = (time.perf_counter() - req_t0) * 1000
 
-        llm_output_2 = (out2.outputs[0].text or "").strip()
-        safety_2 = _safety_check(input_text=llm_input_text, output_text=llm_output_2)
+        llm_output_2_raw = (out2.outputs[0].text or "").strip()
+        llm_output_2 = _trim_llm_preamble(llm_output_2_raw)
+        safety_2 = _safety_check(input_text=llm_input_text, output_text=llm_output_2, allow_reordering=allow_reordering)
         passes.append(
             {
                 "pass": "repair",
@@ -1119,7 +1301,7 @@ Context (for formatting only, not for inventing content):
 
         trimmed_2 = _trim_output_to_safe_candidate(input_text=llm_input_text, output_text=llm_output_2)
         if trimmed_2 is not None:
-            safety_trim_2 = _safety_check(input_text=llm_input_text, output_text=trimmed_2)
+            safety_trim_2 = _safety_check(input_text=llm_input_text, output_text=trimmed_2, allow_reordering=allow_reordering)
             passes.append(
                 {
                     "pass": "repair_trim",
