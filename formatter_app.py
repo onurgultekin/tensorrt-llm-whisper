@@ -315,6 +315,8 @@ def web():
         domain: Optional[str],
         title: Optional[str],
         language: str,
+        dictionary: Optional[list] = None,
+        snippets: Optional[list] = None,
     ) -> str:
         ctx_lines = [f"ACTIVE_APP: {active_app or 'Unknown'}"]
         if language and language != "auto":
@@ -423,6 +425,8 @@ Girdi: "Şimdi şöyle yapalım. Sen devam et ikinci sayfadan başla. Üçer say
     class FormatContext(BaseModel):
         active_app: Optional[str] = None
         browser: Optional[BrowserContext] = None
+        dictionary: Optional[list] = None  # [{term, pronunciation, category}]
+        snippets: Optional[list] = None    # [{name, content, category}]
 
     class FormatRequest(BaseModel):
         text: str = Field(..., min_length=1)

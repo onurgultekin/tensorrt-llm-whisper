@@ -765,26 +765,42 @@ def web():
                 return True
         return False
 
-    def _safety_check(*, input_text: str, output_text: str, allow_reordering: bool = False) -> dict:
+    def _safety_check(*, input_text: str, output_text: str, allow_reordering: bool = False, dictionary_terms: Optional[list] = None) -> dict:
         in_tokens = _word_tokens(input_text)
         out_tokens = _word_tokens(output_text)
         in_set = set(in_tokens)
         
-        # Check for truly new tokens (not morphological variants)
+        # Build whitelist from dictionary terms (these are allowed even if not in input)
+        dict_whitelist = set()
+        if dictionary_terms:
+            for entry in dictionary_terms:
+                term = entry.get("term", "") if isinstance(entry, dict) else ""
+                if term:
+                    # Add all word tokens from the term to whitelist (lowercased for matching)
+                    dict_whitelist.update(t.lower() for t in _word_tokens(term))
+        
+        # Check for truly new tokens (not morphological variants or dictionary terms)
         out_new = []
         for out_tok in out_tokens:
             if out_tok in in_set:
+                continue
+            # Check if it's in dictionary whitelist (case-insensitive)
+            if out_tok.lower() in dict_whitelist:
                 continue
             # Check if it's a morphological variant of any input token
             is_variant = any(_is_morphological_variant(out_tok, in_tok) for in_tok in in_tokens)
             if not is_variant:
                 out_new.append(out_tok)
         
+        # For subsequence check, filter out dictionary terms from output
+        # (they can appear anywhere since they're replacements)
+        out_tokens_for_subseq = [t for t in out_tokens if t.lower() not in dict_whitelist]
+        
         # For formatting contexts (email, doc), allow reordering as long as no new words
         if allow_reordering:
             # Check if all output tokens exist in input (allowing reordering)
             all_tokens_present = all(
-                any(_is_morphological_variant(out_tok, in_tok) for in_tok in in_tokens)
+                out_tok.lower() in dict_whitelist or any(_is_morphological_variant(out_tok, in_tok) for in_tok in in_tokens)
                 for out_tok in out_tokens
             )
             ok = bool(output_text.strip()) and (len(out_new) == 0) and all_tokens_present
@@ -799,7 +815,8 @@ def web():
             }
         
         # Standard strict check (for chat, generic, etc.)
-        subseq_ok = _is_subsequence(in_tokens, out_tokens)
+        # Use filtered tokens for subsequence (excluding dictionary terms)
+        subseq_ok = _is_subsequence(in_tokens, out_tokens_for_subseq)
         ok = bool(output_text.strip()) and (len(out_new) == 0) and subseq_ok
         return {
             "ok": ok,
@@ -974,6 +991,7 @@ def web():
         domain: Optional[str],
         title: Optional[str],
         language: str,
+        dictionary: Optional[list] = None,
     ) -> str:
         ctx_lines = [f"ACTIVE_APP: {active_app or 'Unknown'}"]
         if language and language != "auto":
@@ -983,6 +1001,31 @@ def web():
         if title:
             ctx_lines.append(f"BROWSER_TITLE: {title}")
         ctx = "\n".join(ctx_lines)
+        
+        # Build dictionary rules if provided
+        dictionary_rules = ""
+        if dictionary and len(dictionary) > 0:
+            dict_items = []
+            preserve_terms = []
+            for entry in dictionary[:50]:  # Limit to 50 entries to avoid token overflow
+                term = entry.get("term", "")
+                pronunciation = entry.get("pronunciation", "")
+                if term:
+                    if pronunciation:
+                        # Has pronunciation mapping
+                        dict_items.append(f'  - "{pronunciation}" → "{term}"')
+                    else:
+                        # Just a term to preserve (no pronunciation)
+                        preserve_terms.append(f'"{term}"')
+            
+            rules_parts = []
+            if dict_items:
+                rules_parts.append("Sound mappings (use exact spelling):\n" + "\n".join(dict_items))
+            if preserve_terms:
+                rules_parts.append("Preserve these terms exactly (do NOT change spelling): " + ", ".join(preserve_terms))
+            
+            if rules_parts:
+                dictionary_rules = "\n\nCUSTOM VOCABULARY:\n" + "\n".join(rules_parts)
 
         template_rules = {
             "email": (
@@ -1072,7 +1115,7 @@ Output: "I need to buy:
 Also pick up the dry cleaning."
 
 Template: {template_rules}
-Context: {ctx}
+Context: {ctx}{dictionary_rules}
 
 Remember: Output ONLY the cleaned text. Start immediately with the text itself. When you see multiple tasks/items, FORMAT AS BULLET LIST.""".strip()
 
@@ -1113,10 +1156,12 @@ OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of
         ]
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-    def _parse_format_context(ctx: object) -> tuple[str, Optional[str], Optional[str]]:
+    def _parse_format_context(ctx: object) -> tuple[str, Optional[str], Optional[str], Optional[list], Optional[list]]:
         active_app = ""
         domain: Optional[str] = None
         title: Optional[str] = None
+        dictionary: Optional[list] = None
+        snippets: Optional[list] = None
 
         if isinstance(ctx, dict):
             aa = ctx.get("active_app")
@@ -1131,8 +1176,26 @@ OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of
                 t = browser.get("title")
                 if isinstance(t, str) and t.strip():
                     title = t.strip()
+            
+            # Parse dictionary entries for pronunciation/spelling guidance
+            dict_entries = ctx.get("dictionary")
+            if isinstance(dict_entries, list) and dict_entries:
+                dictionary = [
+                    {"term": e.get("term"), "pronunciation": e.get("pronunciation"), "category": e.get("category")}
+                    for e in dict_entries
+                    if isinstance(e, dict) and e.get("term")
+                ]
+            
+            # Parse snippets for text expansion
+            snippet_entries = ctx.get("snippets")
+            if isinstance(snippet_entries, list) and snippet_entries:
+                snippets = [
+                    {"name": s.get("name"), "content": s.get("content"), "category": s.get("category")}
+                    for s in snippet_entries
+                    if isinstance(s, dict) and s.get("name") and s.get("content")
+                ]
 
-        return active_app, domain, title
+        return active_app, domain, title, dictionary, snippets
 
     async def _format_text(
         *,
@@ -1160,13 +1223,33 @@ OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of
                 "passes": [],
             }
 
-        active_app, domain, title = _parse_format_context(context)
+        active_app, domain, title, dictionary, snippets = _parse_format_context(context)
         if template == "auto":
             template = _infer_template(active_app=active_app, domain=domain, title=title)
 
         language = _infer_language(text=raw, hint=language_hint)
-        llm_input_text, preprocess_info = _preprocess_llm_input(raw)
+        
+        # Apply snippet expansion BEFORE LLM processing
+        expanded_text = raw
+        snippet_expansions = []
+        if snippets:
+            for snippet in snippets:
+                name = snippet.get("name", "").lower()
+                content = snippet.get("content", "")
+                if name and content:
+                    # Check if snippet name appears in text (case-insensitive)
+                    import re
+                    pattern = re.compile(r'\b' + re.escape(name) + r'\b', re.IGNORECASE)
+                    if pattern.search(expanded_text):
+                        expanded_text = pattern.sub(content, expanded_text)
+                        snippet_expansions.append({"name": name, "content": content})
+        
+        llm_input_text, preprocess_info = _preprocess_llm_input(expanded_text)
         llm_input_text = _normalize_ws(llm_input_text)
+        
+        # Add snippet expansion info to preprocess
+        if snippet_expansions:
+            preprocess_info["snippet_expansions"] = snippet_expansions
 
         if not llm or not sampling:
             return {
@@ -1192,6 +1275,7 @@ OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of
             domain=domain,
             title=title,
             language=language,
+            dictionary=dictionary,
         )
         is_email_template = template == "email"
         prompt = _build_prompt(system=system, user_text=llm_input_text, is_email=is_email_template)
@@ -1209,7 +1293,7 @@ OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of
         
         # Allow reordering for email/doc templates (formatting contexts)
         allow_reordering = template in {"email", "doc"}
-        safety_1 = _safety_check(input_text=llm_input_text, output_text=llm_output_1, allow_reordering=allow_reordering)
+        safety_1 = _safety_check(input_text=llm_input_text, output_text=llm_output_1, allow_reordering=allow_reordering, dictionary_terms=dictionary)
         passes.append(
             {
                 "pass": "main",
@@ -1237,7 +1321,7 @@ OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of
 
         trimmed_1 = _trim_output_to_safe_candidate(input_text=llm_input_text, output_text=llm_output_1)
         if trimmed_1 is not None:
-            safety_trim_1 = _safety_check(input_text=llm_input_text, output_text=trimmed_1, allow_reordering=allow_reordering)
+            safety_trim_1 = _safety_check(input_text=llm_input_text, output_text=trimmed_1, allow_reordering=allow_reordering, dictionary_terms=dictionary)
             passes.append(
                 {
                     "pass": "main_trim",
@@ -1273,7 +1357,7 @@ OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of
 
         llm_output_2_raw = (out2.outputs[0].text or "").strip()
         llm_output_2 = _trim_llm_preamble(llm_output_2_raw)
-        safety_2 = _safety_check(input_text=llm_input_text, output_text=llm_output_2, allow_reordering=allow_reordering)
+        safety_2 = _safety_check(input_text=llm_input_text, output_text=llm_output_2, allow_reordering=allow_reordering, dictionary_terms=dictionary)
         passes.append(
             {
                 "pass": "repair",
@@ -1301,7 +1385,7 @@ OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of
 
         trimmed_2 = _trim_output_to_safe_candidate(input_text=llm_input_text, output_text=llm_output_2)
         if trimmed_2 is not None:
-            safety_trim_2 = _safety_check(input_text=llm_input_text, output_text=trimmed_2, allow_reordering=allow_reordering)
+            safety_trim_2 = _safety_check(input_text=llm_input_text, output_text=trimmed_2, allow_reordering=allow_reordering, dictionary_terms=dictionary)
             passes.append(
                 {
                     "pass": "repair_trim",
@@ -1357,6 +1441,7 @@ OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of
         timestamps = False
         num_beams = 1
         max_new_tokens = 448  # Base value, will be dynamically adjusted per audio duration
+        initial_prompt = ""  # Custom vocabulary from dictionary
         format_enabled = True
         format_template = "auto"
         format_context: object = {}
@@ -1416,6 +1501,7 @@ OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of
                 
                 cfg_local = InferenceConfig(
                     text_prefix=text_prefix_with_context,
+                    initial_prompt=initial_prompt,  # Custom vocabulary from dictionary
                     num_beams=num_beams,
                     max_new_tokens=dynamic_max_tokens,
                 )
@@ -1552,6 +1638,37 @@ OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of
 
                         segment_silence_ms = int(data.get("segment_silence_ms", segment_silence_ms))
                         min_segment_ms = int(data.get("min_segment_ms", min_segment_ms))
+                        
+                        # Build initial_prompt from dictionary entries for Whisper
+                        # Limit: ~50 chars per term, max 100 chars total to stay under token limit
+                        # Engine limit is 466 tokens, max_new_tokens=448, so we have ~18 tokens for prompt
+                        # ~4 chars per token means ~70 chars max, we use 100 to be safe
+                        initial_prompt = ""
+                        if isinstance(format_context, dict):
+                            dictionary = format_context.get("dictionary")
+                            if isinstance(dictionary, list) and dictionary:
+                                # Extract terms for Whisper's initial prompt (spelling guidance)
+                                terms = []
+                                total_len = 0
+                                max_total_chars = 60  # Safe limit for token budget
+                                max_term_chars = 30   # Skip very long terms
+                                for entry in dictionary[:30]:  # Limit to 30 entries
+                                    if isinstance(entry, dict):
+                                        term = entry.get("term", "")
+                                        if term and isinstance(term, str):
+                                            term = term.strip()
+                                            # Skip terms that are too long
+                                            if len(term) > max_term_chars:
+                                                continue
+                                            # Check if adding this term would exceed limit
+                                            add_len = len(term) + 2  # +2 for ", "
+                                            if total_len + add_len > max_total_chars:
+                                                break
+                                            terms.append(term)
+                                            total_len += add_len
+                                if terms:
+                                    initial_prompt = " " + ", ".join(terms) + "."
+                                    print(f"📚 Dictionary terms for Whisper: {initial_prompt.strip()}")
 
                         if sr != 16000:
                             await ws.send_json(

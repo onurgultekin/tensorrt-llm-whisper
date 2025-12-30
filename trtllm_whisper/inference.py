@@ -38,6 +38,7 @@ class InferenceConfig:
     max_new_tokens: int = 448  # Increased for longer transcriptions (~350 words)
     num_beams: int = 1
     text_prefix: str = "<|startoftranscript|><|en|><|transcribe|><|notimestamps|>"
+    initial_prompt: str = ""  # Custom vocabulary/context to guide transcription
     padding_strategy: str = "max"  # max|longest (single file behaves same) | nopad (cpp only)
 
 
@@ -144,7 +145,14 @@ class WhisperTRTLLMRunner:
             raise ValueError("padding_strategy must be one of: max|longest|nopad")
 
         input_lengths = torch.tensor([mel.shape[2]], dtype=torch.int32, device="cuda")
-        prompt_ids = self.tokenizer.encode(cfg.text_prefix, allowed_special=self.tokenizer.special_tokens_set)
+        
+        # Build full prompt: initial_prompt (with <|startofprev|>) + text_prefix
+        full_prefix = cfg.text_prefix
+        if cfg.initial_prompt:
+            clean_prompt = cfg.initial_prompt.strip()
+            full_prefix = f"<|startofprev|>{clean_prompt}<|endoftext|>" + cfg.text_prefix
+        
+        prompt_ids = self.tokenizer.encode(full_prefix, allowed_special=self.tokenizer.special_tokens_set)
         decoder_input_ids = torch.tensor(prompt_ids, dtype=torch.int64).unsqueeze(0)  # [B=1, prompt]
 
         # ModelRunnerCpp expects encoder_input_features as [B, T, n_mels]
@@ -211,7 +219,14 @@ class WhisperTRTLLMRunner:
         # encoder_output_lengths must match the actual encoder output shape (after padding and downsampling)
         # Whisper encoder downsamples by 2x, so output length = padded_frames // 2
         input_lengths = torch.tensor([mel.shape[2] // 2], dtype=torch.int32, device="cuda")
-        prompt_ids = self.tokenizer.encode(cfg.text_prefix, allowed_special=self.tokenizer.special_tokens_set)
+        
+        # Build full prompt: initial_prompt (with <|startofprev|>) + text_prefix
+        full_prefix = cfg.text_prefix
+        if cfg.initial_prompt:
+            clean_prompt = cfg.initial_prompt.strip()
+            full_prefix = f"<|startofprev|>{clean_prompt}<|endoftext|>" + cfg.text_prefix
+        
+        prompt_ids = self.tokenizer.encode(full_prefix, allowed_special=self.tokenizer.special_tokens_set)
         decoder_input_ids = torch.tensor(prompt_ids, dtype=torch.int64).unsqueeze(0)  # [B=1, prompt]
 
         # ModelRunnerCpp expects encoder_input_features as [B, T, n_mels]
@@ -321,7 +336,18 @@ class WhisperTRTLLMRunner:
         # encoder_output_lengths must match the actual encoder output shape (after padding and downsampling)
         # Whisper encoder downsamples by 2x, so output length = padded_frames // 2
         input_lengths = torch.tensor([mel.shape[2] // 2], dtype=torch.int32, device="cuda")
-        prompt_ids = self.tokenizer.encode(cfg.text_prefix, allowed_special=self.tokenizer.special_tokens_set)
+        
+        # Build full prompt: initial_prompt (with <|startofprev|>) + text_prefix
+        # Whisper expects: <|startofprev|> [context] <|startoftranscript|><|lang|><|task|><|notimestamps|>
+        # The initial_prompt provides context/vocabulary hints BEFORE the main transcription tokens
+        full_prefix = cfg.text_prefix
+        if cfg.initial_prompt:
+            clean_prompt = cfg.initial_prompt.strip()
+            # Prepend with <|startofprev|> token for proper Whisper conditioning
+            full_prefix = f"<|startofprev|>{clean_prompt}<|endoftext|>" + cfg.text_prefix
+        
+        prompt_ids = self.tokenizer.encode(full_prefix, allowed_special=self.tokenizer.special_tokens_set)
+        decoder_input_ids = torch.tensor(prompt_ids, dtype=torch.int64).unsqueeze(0)  # [B=1, prompt]
         decoder_input_ids = torch.tensor(prompt_ids, dtype=torch.int64).unsqueeze(0)  # [B=1, prompt]
 
         encoder_input_features = mel.transpose(1, 2)  # [B, T, n_mels]
@@ -354,6 +380,7 @@ class WhisperTRTLLMRunner:
         token_ids = token_ids[len(prompt_ids):]
         if self.eot_id in token_ids:
             token_ids = token_ids[:token_ids.index(self.eot_id)]
+        text = self._decode_tokens(token_ids)
         text = self._decode_tokens(token_ids)
         post_ms = (time.perf_counter() - post_t0) * 1000
 
