@@ -992,6 +992,7 @@ def web():
         title: Optional[str],
         language: str,
         dictionary: Optional[list] = None,
+        tone: Optional[dict] = None,
     ) -> str:
         ctx_lines = [f"ACTIVE_APP: {active_app or 'Unknown'}"]
         if language and language != "auto":
@@ -1001,6 +1002,13 @@ def web():
         if title:
             ctx_lines.append(f"BROWSER_TITLE: {title}")
         ctx = "\n".join(ctx_lines)
+        
+        # Build tone/style rules if provided
+        tone_rules = ""
+        if tone and tone.get("promptModifier"):
+            tone_name = tone.get("name", "Custom")
+            tone_modifier = tone.get("promptModifier", "")
+            tone_rules = f"\n\nIMPORTANT - STYLE/TONE ({tone_name}):\nApply these style rules to the output:\n{tone_modifier}"
         
         # Build dictionary rules if provided
         dictionary_rules = ""
@@ -1115,7 +1123,7 @@ Output: "I need to buy:
 Also pick up the dry cleaning."
 
 Template: {template_rules}
-Context: {ctx}{dictionary_rules}
+Context: {ctx}{dictionary_rules}{tone_rules}
 
 Remember: Output ONLY the cleaned text. Start immediately with the text itself. When you see multiple tasks/items, FORMAT AS BULLET LIST.""".strip()
 
@@ -1156,12 +1164,13 @@ OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of
         ]
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-    def _parse_format_context(ctx: object) -> tuple[str, Optional[str], Optional[str], Optional[list], Optional[list]]:
+    def _parse_format_context(ctx: object) -> tuple[str, Optional[str], Optional[str], Optional[list], Optional[list], Optional[dict]]:
         active_app = ""
         domain: Optional[str] = None
         title: Optional[str] = None
         dictionary: Optional[list] = None
         snippets: Optional[list] = None
+        tone: Optional[dict] = None
 
         if isinstance(ctx, dict):
             aa = ctx.get("active_app")
@@ -1176,6 +1185,17 @@ OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of
                 t = browser.get("title")
                 if isinstance(t, str) and t.strip():
                     title = t.strip()
+            
+            # Parse tone for style guidance
+            tone_data = ctx.get("tone")
+            if isinstance(tone_data, dict):
+                tone_name = tone_data.get("name")
+                tone_modifier = tone_data.get("promptModifier")
+                if isinstance(tone_name, str) and tone_name.strip():
+                    tone = {
+                        "name": tone_name.strip(),
+                        "promptModifier": tone_modifier.strip() if isinstance(tone_modifier, str) else "",
+                    }
             
             # Parse dictionary entries for pronunciation/spelling guidance
             dict_entries = ctx.get("dictionary")
@@ -1195,7 +1215,7 @@ OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of
                     if isinstance(s, dict) and s.get("name") and s.get("content")
                 ]
 
-        return active_app, domain, title, dictionary, snippets
+        return active_app, domain, title, dictionary, snippets, tone
 
     async def _format_text(
         *,
@@ -1223,7 +1243,7 @@ OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of
                 "passes": [],
             }
 
-        active_app, domain, title, dictionary, snippets = _parse_format_context(context)
+        active_app, domain, title, dictionary, snippets, tone = _parse_format_context(context)
         if template == "auto":
             template = _infer_template(active_app=active_app, domain=domain, title=title)
 
@@ -1276,6 +1296,7 @@ OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of
             title=title,
             language=language,
             dictionary=dictionary,
+            tone=tone,
         )
         is_email_template = template == "email"
         prompt = _build_prompt(system=system, user_text=llm_input_text, is_email=is_email_template)
