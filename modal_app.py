@@ -1314,6 +1314,11 @@ OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of
         
         # Allow reordering for email/doc templates (formatting contexts)
         allow_reordering = template in {"email", "doc"}
+        
+        # Tones that allow more LLM freedom (word addition/removal)
+        tone_name = tone.get("name", "") if tone else ""
+        skip_safety_for_tone = tone_name in {"Direct", "Verbose"}
+        
         safety_1 = _safety_check(input_text=llm_input_text, output_text=llm_output_1, allow_reordering=allow_reordering, dictionary_terms=dictionary)
         passes.append(
             {
@@ -1323,7 +1328,8 @@ OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of
             }
         )
 
-        if safety_1.get("ok"):
+        # For Direct/Verbose tones, trust LLM output without strict safety check
+        if safety_1.get("ok") or skip_safety_for_tone:
             return {
                 "text": llm_output_1,
                 "raw_text": raw,
@@ -1337,7 +1343,7 @@ OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of
                 "server_total_ms": server_total_ms,
                 "prompt_version": FORMATTER_PROMPT_VERSION,
                 "passes": passes,
-                "used_pass": "main",
+                "used_pass": "main" if safety_1.get("ok") else "main_tone_bypass",
             }
 
         trimmed_1 = _trim_output_to_safe_candidate(input_text=llm_input_text, output_text=llm_output_1)
