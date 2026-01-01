@@ -493,6 +493,50 @@ def web():
 
         return 0, -1
 
+    # Simple RMS-based voice activity detection (no external dependencies)
+    def _has_voice_activity(pcm_bytes: bytes, sr: int = 16000, rms_threshold: float = 50.0, min_speech_ratio: float = 0.02) -> bool:
+        """Check if audio has significant voice activity using RMS energy.
+        
+        Args:
+            pcm_bytes: Raw PCM16LE audio bytes
+            sr: Sample rate (unused, for API compatibility)
+            rms_threshold: RMS threshold for speech detection (default 50, lowered for sensitivity)
+            min_speech_ratio: Minimum ratio of speech frames (default 2%)
+        """
+        try:
+            import numpy as np
+            audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+            
+            if len(audio) == 0:
+                return False
+            
+            # Calculate RMS in 30ms windows
+            window_size = int(0.03 * 16000)  # 30ms at 16kHz
+            if len(audio) < window_size:
+                rms = np.sqrt(np.mean(audio ** 2))
+                return rms > rms_threshold
+            
+            # Count windows with speech
+            n_windows = len(audio) // window_size
+            speech_windows = 0
+            max_rms = 0.0
+            
+            for i in range(n_windows):
+                window = audio[i * window_size:(i + 1) * window_size]
+                rms = np.sqrt(np.mean(window ** 2))
+                max_rms = max(max_rms, rms)
+                if rms > rms_threshold:
+                    speech_windows += 1
+            
+            speech_ratio = speech_windows / n_windows if n_windows > 0 else 0
+            has_speech = speech_ratio >= min_speech_ratio
+            
+            print(f"🔊 VAD: max_rms={max_rms:.1f}, speech_ratio={speech_ratio:.2%}, has_speech={has_speech}")
+            return has_speech
+        except Exception as e:
+            print(f"⚠️  VAD check failed: {e}")
+            return True  # On error, assume voice is present
+
     api = FastAPI()
 
     def _init_models() -> None:
@@ -1520,6 +1564,19 @@ OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of
                     buffer = bytearray()
                     last_voice_ts = time.monotonic()
 
+                # VAD check: skip silent audio to avoid garbage output
+                if not _has_voice_activity(pcm, sr=sr):
+                    print(f"🔇 Skipping silent audio segment ({audio_sec:.2f}s)")
+                    return {
+                        "reason": reason,
+                        "text": "",
+                        "full_text": " ".join(s for s in segments if s).strip(),
+                        "overlap": {"used": bool(used_overlap), "removed_words": 0, "sec": overlap_sec if used_overlap else 0},
+                        "audio_sec": audio_sec,
+                        "rtf_cuda": None,
+                        "timings_ms": {"skipped": "silence"},
+                    }
+
                 # Dynamic max_new_tokens based on audio duration (clamped to engine capacity)
                 estimated_tokens = int(audio_sec * 4 * 1.5)
                 dynamic_max_tokens = max(max_new_tokens, min(estimated_tokens, engine_max_output_len))
@@ -1543,6 +1600,21 @@ OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of
 
                 server_total_ms = (time.perf_counter() - t0) * 1000
                 text = (result.get("text") or "").strip()
+                
+                # Filter out garbage patterns that indicate silence or unintelligible audio
+                # Whisper sometimes outputs `||_|...` or similar patterns for silent/noisy audio
+                garbage_chars = set(text)
+                if garbage_chars and garbage_chars <= {'|', '_', ' ', '\n'}:
+                    print(f"⚠️  Filtered garbage output: '{text[:50]}...' (likely silence)")
+                    text = ""
+                elif '||_|' in text or '|_|_|' in text:
+                    # Remove garbage suffix if present
+                    import re
+                    garbage_pattern = re.compile(r'\|[\|_\s]+$')
+                    cleaned = garbage_pattern.sub('', text).strip()
+                    if cleaned != text:
+                        print(f"⚠️  Trimmed garbage suffix from: '{text[-50:]}' -> '{cleaned[-50:]}'")
+                        text = cleaned
                 
                 print(f"✅ Transcription result: '{text}' ({server_total_ms:.0f}ms)")
                 
