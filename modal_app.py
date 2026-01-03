@@ -406,7 +406,7 @@ def web():
     from typing import Optional
 
     import torch
-    from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+    from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
     from tensorrt_llm import LLM, SamplingParams
     from trtllm_whisper.inference import InferenceConfig, WhisperTRTLLMRunner
     from transformers import AutoTokenizer
@@ -1943,6 +1943,124 @@ OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of
             return result
         text = runner.transcribe_bytes(audio_bytes, suffix=suffix, cfg=cfg)
         return {"text": text}
+
+    @api.post("/transform")
+    async def transform_text(
+        selected_text: str = Form(...),
+        command: str = Form(...),
+        language: str = Form("en"),
+    ):
+        """Transform selected text according to a voice command using LLM."""
+        nonlocal llm, llm_init_error, gen_lock
+
+        if llm is None:
+            raise HTTPException(status_code=503, detail=llm_init_error or "LLM not ready")
+
+        req_t0 = time.perf_counter()
+
+        # Build prompt for text transformation
+        prompt = f"""Transform the text according to the user's instruction.
+
+INSTRUCTION: {command}
+
+TEXT TO TRANSFORM:
+{selected_text}
+
+RULES:
+- Return ONLY the transformed result
+- NO explanations, NO commentary, NO introductions
+- Follow the instruction exactly (if translate, translate; if summarize, summarize)
+- Keep the same format/structure unless instructed otherwise
+
+RESULT:"""
+
+        try:
+            async with gen_lock:
+                outputs = llm.generate(
+                    [prompt],
+                    sampling_params=SamplingParams(
+                        max_tokens=len(selected_text) * 3,  # Allow expansion
+                        temperature=0.3,
+                        top_p=0.9,
+                    ),
+                )
+
+            result = outputs[0].outputs[0].text.strip()
+            
+            # Clean up common LLM artifacts
+            result = _trim_llm_preamble(result)
+            result = _normalize_ws(result)
+
+            transform_ms = (time.perf_counter() - req_t0) * 1000
+            print(f"🔄 Transform completed in {transform_ms:.0f}ms: '{command[:50]}...' -> {len(result)} chars")
+
+            return {
+                "text": result,
+                "original_length": len(selected_text),
+                "transformed_length": len(result),
+                "command": command,
+                "transform_ms": transform_ms,
+            }
+        except Exception as e:
+            print(f"Transform error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @api.post("/enhance-prompt")
+    async def enhance_prompt(
+        raw_prompt: str = Form(...),
+        app_name: str = Form(""),
+        language: str = Form("en"),
+    ):
+        """Enhance a simple voice dictation into a detailed AI coding prompt."""
+        nonlocal llm, llm_init_error, gen_lock
+
+        if llm is None:
+            raise HTTPException(status_code=503, detail=llm_init_error or "LLM not ready")
+
+        req_t0 = time.perf_counter()
+
+        # Build prompt for enhancement
+        prompt = f"""Transform this voice dictation into a detailed prompt for an AI code assistant.
+
+INPUT: {raw_prompt}
+
+OUTPUT REQUIREMENTS:
+- Return ONLY the enhanced prompt, nothing else
+- Use the SAME LANGUAGE as the input (if Turkish input, Turkish output)
+- NO explanations, NO translations, NO commentary
+- NO markdown formatting or bullet points unless natural for the prompt
+- Keep it as a single coherent instruction paragraph
+
+ENHANCED PROMPT:"""
+
+        try:
+            async with gen_lock:
+                outputs = llm.generate(
+                    [prompt],
+                    sampling_params=SamplingParams(
+                        max_tokens=500,
+                        temperature=0.4,
+                        top_p=0.9,
+                    ),
+                )
+
+            result = outputs[0].outputs[0].text.strip()
+            
+            # Clean up
+            result = _trim_llm_preamble(result)
+            result = _normalize_ws(result)
+
+            enhance_ms = (time.perf_counter() - req_t0) * 1000
+            print(f"🚀 Prompt enhanced in {enhance_ms:.0f}ms: '{raw_prompt[:40]}...' -> {len(result)} chars")
+
+            return {
+                "enhanced_prompt": result,
+                "original_prompt": raw_prompt,
+                "enhance_ms": enhance_ms,
+            }
+        except Exception as e:
+            print(f"Enhance prompt error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
     return api
 
