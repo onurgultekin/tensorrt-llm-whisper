@@ -158,12 +158,15 @@ class WhisperTRTLLMRunner:
         # ModelRunnerCpp expects encoder_input_features as [B, T, n_mels]
         encoder_input_features = mel.transpose(1, 2)
 
+        # Account for prompt length when calculating available tokens for generation
+        available_tokens = max(1, self.max_output_len - len(prompt_ids))
+        
         with torch.no_grad():
             outputs = self.model_runner.generate(
                 batch_input_ids=decoder_input_ids,
                 encoder_input_features=encoder_input_features,
                 encoder_output_lengths=input_lengths // 2,
-                max_new_tokens=min(cfg.max_new_tokens, self.max_output_len),
+                max_new_tokens=min(cfg.max_new_tokens, available_tokens),
                 end_id=self.eot_id,
                 pad_id=self.eot_id,
                 num_beams=cfg.num_beams,
@@ -232,6 +235,9 @@ class WhisperTRTLLMRunner:
         # ModelRunnerCpp expects encoder_input_features as [B, T, n_mels]
         encoder_input_features = mel.transpose(1, 2)
 
+        # Account for prompt length when calculating available tokens for generation
+        available_tokens = max(1, self.max_output_len - len(prompt_ids))
+
         gen_wall_t0 = time.perf_counter()
         gen_evt_start = torch.cuda.Event(enable_timing=True)
         gen_evt_end = torch.cuda.Event(enable_timing=True)
@@ -241,7 +247,7 @@ class WhisperTRTLLMRunner:
                 batch_input_ids=decoder_input_ids,
                 encoder_input_features=encoder_input_features,
                 encoder_output_lengths=input_lengths,
-                max_new_tokens=min(cfg.max_new_tokens, self.max_output_len),
+                max_new_tokens=min(cfg.max_new_tokens, available_tokens),
                 end_id=self.eot_id,
                 pad_id=self.eot_id,
                 num_beams=cfg.num_beams,

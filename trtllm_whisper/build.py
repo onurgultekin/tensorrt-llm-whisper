@@ -17,7 +17,7 @@ class BuildConfig:
     max_batch_size: int = 4  # Increased for inflight batching (multi-user support)
     max_beam_width: int = 1
     max_encoder_input_len: int = 3000
-    max_output_len: int = 448  # 30 seconds max per chunk (~180 words)
+    max_output_len: int = 1024  # Increased for dictionary/initial_prompt support (~500 chars)
     paged_kv_cache: bool = True
     remove_input_padding: bool = True
 

@@ -1739,9 +1739,8 @@ OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of
                         min_segment_ms = int(data.get("min_segment_ms", min_segment_ms))
                         
                         # Build initial_prompt from dictionary entries for Whisper
-                        # Limit: ~50 chars per term, max 100 chars total to stay under token limit
-                        # Engine limit is 466 tokens, max_new_tokens=448, so we have ~18 tokens for prompt
-                        # ~4 chars per token means ~70 chars max, we use 100 to be safe
+                        # Engine max_output_len=1024, we reserve ~100 tokens for prompt (~400 chars)
+                        # This leaves 924+ tokens for actual transcription output
                         initial_prompt = ""
                         if isinstance(format_context, dict):
                             dictionary = format_context.get("dictionary")
@@ -1749,9 +1748,9 @@ OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of
                                 # Extract terms for Whisper's initial prompt (spelling guidance)
                                 terms = []
                                 total_len = 0
-                                max_total_chars = 60  # Safe limit for token budget
-                                max_term_chars = 30   # Skip very long terms
-                                for entry in dictionary[:30]:  # Limit to 30 entries
+                                max_total_chars = 400  # ~100 tokens for dictionary terms
+                                max_term_chars = 50    # Skip very long terms
+                                for entry in dictionary[:100]:  # Limit to 100 entries
                                     if isinstance(entry, dict):
                                         term = entry.get("term", "")
                                         if term and isinstance(term, str):
@@ -1767,7 +1766,7 @@ OUTPUT FORMAT: Just the cleaned text, nothing else. Start with the first word of
                                             total_len += add_len
                                 if terms:
                                     initial_prompt = " " + ", ".join(terms) + "."
-                                    print(f"📚 Dictionary terms for Whisper: {initial_prompt.strip()}")
+                                    print(f"📚 Dictionary terms for Whisper ({len(terms)} terms): {initial_prompt.strip()}")
 
                         if sr != 16000:
                             await ws.send_json(
